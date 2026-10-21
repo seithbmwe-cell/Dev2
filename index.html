@@ -1,0 +1,116 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Digit Differ Frequency Bot (DEMO ONLY)</title>
+<style>
+:root{--bg:#0f1218;--c:#181d27;--b:#2a3242;--t:#e8ecf3;--m:#8b95a8;--g:#2ecc71;--r:#ff5c5c;--y:#f5c542;--a:#5b9dff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t);font:15px/1.4 system-ui,sans-serif;padding:10px;max-width:760px;margin-inline:auto}
+h1{font-size:18px;margin:6px 0}.card{background:var(--c);border:1px solid var(--b);border-radius:12px;padding:12px;margin:10px 0}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--m);margin:0 0 8px}
+label{display:block;font-size:12px;color:var(--m);margin:6px 0 2px}input,select{width:100%;padding:9px;border-radius:8px;border:1px solid var(--b);background:#0f1218;color:var(--t);font-size:15px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}button{padding:11px;border:0;border-radius:8px;font-weight:600;font-size:15px;background:var(--a);color:#fff;width:100%}
+button:disabled{opacity:.4}button.stop{background:var(--r)}button.go{background:var(--g);color:#06210f}button.x{background:#3a4357}
+.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:6px}.d{border:1px solid var(--b);border-radius:8px;padding:6px 2px;text-align:center;font-size:12px}
+.d b{display:block;font-size:20px}.q{border-color:var(--y)}.s{background:#1d3a5f;border-color:var(--a)}
+.st{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;text-align:center}.st div{background:#0f1218;border-radius:8px;padding:6px;font-size:12px;color:var(--m)}.st b{display:block;font-size:17px;color:var(--t)}
+#log{height:220px;overflow:auto;font:12px/1.5 ui-monospace,monospace;background:#0b0e13;border-radius:8px;padding:8px}.e{color:var(--r)}.pill{display:inline-block;padding:2px 8px;border-radius:99px;background:#2a3242;font-size:12px}
+.warn{color:var(--y);font-size:12px}
+</style></head><body>
+<h1>Digit Differ Frequency Bot <span class="pill" id="state">DISCONNECTED</span></h1>
+<p class="warn">Demo accounts only. Real-money accounts are refused. Credentials live in memory only.</p>
+
+<div class="card"><h2>Connection</h2>
+<label>Personal Access Token (scope: trade)</label><input id="pat" type="password" autocomplete="off">
+<div class="row" style="margin-top:8px"><button id="conn">Connect</button><button id="disc" class="x" disabled>Disconnect</button></div>
+<div id="cstat" class="warn" style="margin-top:6px">Not connected</div></div>
+
+<div class="card"><h2>Strategy</h2>
+<label>Market</label><select id="mkt" disabled></select>
+<div class="row"><div><label>Fixed stake</label><input id="stake" type="number" step="0.01" value="1"></div><div><label>Max trades</label><input id="mt" type="number" value="20"></div>
+<div><label>Stop loss</label><input id="sl" type="number" step="0.01" value="5"></div><div><label>Profit target</label><input id="tp" type="number" step="0.01" value="5"></div>
+<div><label>Max consecutive losses</label><input id="mc" type="number" value="3"></div><div><label>Window / threshold</label><input value="100 ticks / &lt; 7.9%" readonly></div></div>
+<label style="color:var(--t);margin-top:10px"><input type="checkbox" id="ok" style="width:auto"> I confirm this is a DEMO account</label>
+<div class="row" style="margin-top:8px"><button id="start" class="go" disabled>Start</button><button id="stop" class="stop" disabled>Stop</button></div></div>
+
+<div class="card"><h2>Live analysis</h2><div class="grid" id="grid"></div>
+<p id="info" style="font-size:13px;color:var(--m)">Ticks: 0/100</p></div>
+
+<div class="card"><h2>Session</h2><div class="st">
+<div><b id="n">0</b>Purchased</div><div><b id="w">0</b>Wins</div><div><b id="l">0</b>Losses</div>
+<div><b id="pl">0.00</b>Net P/L</div><div><b id="cl">0</b>Consec. losses</div><div><b id="bs">-</b>State</div></div></div>
+
+<div class="card"><h2>Activity log</h2><div id="log"></div></div>
+
+<script src="core.js"></script>
+<script>
+const $ = (i) => document.getElementById(i), API = 'https://api.derivws.com';
+const APP_ID = '34K1G9lkiNsgEfPCTxqrh'; // <-- paste your registered Deriv App ID here (public identifier, not a secret)
+let conn = null, bot = null, acct = null, subTick = null;
+const log = (m, err) => { const d = document.createElement('div'); if (err) d.className = 'e'; d.textContent = new Date().toLocaleTimeString() + '  ' + m; $('log').prepend(d); };
+const lim = () => ({ stake: +$('stake').value, maxTrades: +$('mt').value, stopLoss: +$('sl').value, target: +$('tp').value, maxConsec: +$('mc').value });
+
+class Conn { // one WebSocket, req_id matching, timeouts
+  constructor(url, h) { this.id = 1; this.p = new Map(); this.h = h; this.ws = new WebSocket(url);
+    this.ws.onmessage = (e) => { const m = JSON.parse(e.data), p = m.req_id && this.p.get(m.req_id);
+      if (p) { this.p.delete(m.req_id); clearTimeout(p.t); m.error ? p.rej({ ...m.error, uncertain: false }) : p.res(m); } else h.msg(m); };
+    this.ws.onclose = () => { this.p.forEach((p) => { clearTimeout(p.t); p.rej({ uncertain: true, message: 'connection lost' }); }); this.p.clear(); h.close(); };
+    this.ws.onerror = () => log('WebSocket error', 1); }
+  open() { return new Promise((r, j) => { this.ws.onopen = r; setTimeout(() => j(new Error('WebSocket open timeout')), 10000); }); }
+  send(req, ms = 10000) { return new Promise((res, rej) => { if (this.ws.readyState !== 1) return rej({ uncertain: true, message: 'socket not open' });
+    const id = this.id++, t = setTimeout(() => { this.p.delete(id); rej({ uncertain: true, message: 'timeout' }); }, ms);
+    this.p.set(id, { res, rej, t }); this.ws.send(JSON.stringify({ ...req, req_id: id })); }); }
+}
+const render = () => {
+  if (!bot) return; const a = C().analyze(bot.win.digits), w = bot.win, r = bot.risk;
+  $('grid').innerHTML = a.counts.map((c, d) => `<div class="d ${a.ready && a.pct[d] < 7.9 ? 'q' : ''} ${a.sel === d ? 's' : ''}"><b>${d}</b>${c} · ${a.pct[d].toFixed(0)}%<br>${a.sel === d ? 'SELECTED' : a.ready && a.pct[d] < 7.9 ? 'qualifies' : '&nbsp;'}</div>`).join('');
+  $('info').textContent = `Ticks ${w.digits.length}/100 · last ${w.last ? w.last.quote + ' → ' + w.last.digit : '-'} · barrier ${a.sel ?? '-'} · ` + (!a.ready ? 'collecting data' : a.sel === null ? 'no qualifying digit' : 'ready');
+  $('state').textContent = $('bs').textContent = bot.state; $('n').textContent = r.trades; $('w').textContent = r.wins; $('l').textContent = r.losses; $('pl').textContent = r.net.toFixed(2); $('cl').textContent = r.consec;
+  const live = bot.connected && bot.demo; $('start').disabled = !(live && $('ok').checked && !bot.running && bot.state !== 'HALTED_UNCERTAIN'); $('stop').disabled = !bot.running; $('mkt').disabled = !live; $('disc').disabled = !live;
+};
+const C = () => window.Core;
+setInterval(render, 400);
+$('ok').onchange = render;
+
+async function rest(path, tok, app, opt = {}) {
+  const r = await fetch(API + path, { ...opt, headers: { Authorization: 'Bearer ' + tok, 'Deriv-App-ID': app, 'Content-Type': 'application/json' } });
+  const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + JSON.stringify(j.errors || j.error || j).slice(0, 200)); return j;
+}
+$('conn').onclick = async () => {
+  const app = APP_ID, tok = $('pat').value.trim(), want = '';
+  if (app === 'YOUR_APP_ID' || !app) return ($('cstat').textContent = 'Set APP_ID in index.html first');
+  if (!tok) return ($('cstat').textContent = 'Paste your token');
+  $('conn').disabled = true; $('cstat').textContent = 'Connecting…'; bot = new (C().Bot)({ proposal: async (p) => (await conn.send({ proposal: 1, ...p })).proposal, buy: async (id, price) => (await conn.send({ buy: id, price })).buy, }, lim(), log);
+  try {
+    const list = (await rest('/trading/v1/options/accounts', tok, app)).data || [];
+    acct = want ? list.find((a) => a.account_id === want) : list.find((a) => a.account_type === 'demo');
+    if (!acct) throw new Error('No matching account found');
+    if (!C().isDemo(acct)) throw new Error('REFUSED: account is not a verified demo account (account_type=' + acct.account_type + ')');
+    const url = (await rest(`/trading/v1/options/accounts/${encodeURIComponent(acct.account_id)}/otp`, tok, app, { method: 'POST' })).data.url;
+    $('pat').value = ''; // token no longer needed; OTP is single-use (120 s)
+    if (!/\/ws\/demo\?/.test(url)) throw new Error('REFUSED: OTP URL is not the demo endpoint');
+    conn = new Conn(url, { msg: onMsg, close: onClose }); await conn.open();
+    if (!bot.setAccount(acct)) throw new Error('Demo verification failed');
+    $('cstat').textContent = `Connected · DEMO ${acct.account_id} · ${bot.currency}`; log('Authenticated demo account ' + acct.account_id);
+    const s = (await conn.send({ active_symbols: 'brief' })).active_symbols.filter((x) => x.market === 'synthetic_index');
+    $('mkt').innerHTML = s.map((x) => `<option value="${x.symbol}">${x.display_name}</option>`).join('');
+    if (!s.length) throw new Error('No synthetic symbols returned'); if (s.some((x) => x.symbol === 'R_75')) $('mkt').value = 'R_75'; else log('R_75 unavailable; using ' + $('mkt').value);
+    await pickMarket();
+  } catch (e) { $('cstat').textContent = 'Error: ' + (e.message || e.code); log('Connect failed: ' + (e.message || e.code), 1); onClose(true); }
+  $('conn').disabled = false;
+};
+async function pickMarket() {
+  const sym = $('mkt').value; bot.setMarket(sym);
+  try { await conn.send({ forget_all: 'ticks' }); await conn.send({ ticks: sym, subscribe: 1 }); log('Market ' + sym + ': collecting 100 fresh ticks'); }
+  catch (e) { bot.running = false; log('Tick subscription failed: ' + (e.message || e.code), 1); }
+}
+$('mkt').onchange = pickMarket;
+function onMsg(m) {
+  if (m.msg_type === 'tick' && m.tick && m.tick.symbol === bot.symbol) { const before = bot.win.full; bot.onTick(m.tick); if (!before && bot.win.full) log('100-tick window ready'); if (bot.win.full) { const a = C().analyze(bot.win.digits); if (a.sel !== null && bot.running) log('Digit counts ' + a.counts.join(',') + ' → barrier ' + a.sel); } }
+  else if (m.msg_type === 'proposal_open_contract' && m.proposal_open_contract) bot.onContract(m.proposal_open_contract);
+  else if (m.msg_type === 'buy' && m.buy && bot.state === 'CONTRACT_OPEN') conn.send({ proposal_open_contract: 1, contract_id: m.buy.contract_id, subscribe: 1 }).catch((e) => log('Contract watch error: ' + (e.message || e.code), 1));
+}
+const watch = () => { const t = setInterval(() => { if (bot && bot.state === 'CONTRACT_OPEN' && conn && !conn.watching) { conn.watching = bot.contractId; conn.send({ proposal_open_contract: 1, contract_id: bot.contractId, subscribe: 1 }).then((m) => m.proposal_open_contract && bot.onContract(m.proposal_open_contract)).catch((e) => log('Contract watch error: ' + (e.message || e.code), 1)); } if (bot && bot.state !== 'CONTRACT_OPEN' && conn) conn.watching = null; }, 500); return t; }; watch();
+function onClose(quiet) { if (bot) { const was = bot.state; bot.disconnect(); if (was === 'CONTRACT_OPEN' || was === 'PROPOSAL_PENDING') { bot.state = 'HALTED_UNCERTAIN'; log('Connection lost mid-trade: outcome unknown. Check your demo statement; no retry made.', 1); } } if (!quiet) log('Disconnected', 1); $('cstat').textContent = 'Disconnected'; }
+$('disc').onclick = () => { if (conn) { try { conn.ws.send(JSON.stringify({ forget_all: ['ticks', 'proposal_open_contract'] })); } catch (e) {} conn.ws.close(); } };
+$('start').onclick = () => { const v = C().validateLimits(lim()); if (v) return log(v, 1); if (!$('ok').checked) return; if (bot.start(lim())) log('Bot started'); };
+$('stop').onclick = () => { bot.stop(); log('Stopped by user'); };
+render();
+</script></body></html>
